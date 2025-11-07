@@ -65,6 +65,7 @@ class _AsyncWebSocketManager(_WebSocketManager):
         )
         self.connected = False
         self.loop = loop or asyncio.get_event_loop()
+        self.ping_task = None
 
         if ping_timeout:
             warnings.warn(
@@ -78,6 +79,10 @@ class _AsyncWebSocketManager(_WebSocketManager):
         if hasattr(self, "ping_timer") and self.ping_timer:
             self.ping_timer.cancel()
             self.ping_timer = None
+
+        if hasattr(self, "ping_task") and self.ping_task:
+            self.ping_task.cancel()
+            self.ping_task = None
 
         async def _shutdown():
             if getattr(self, "ws", None) and not self.ws.closed:
@@ -195,6 +200,7 @@ class _AsyncWebSocketManager(_WebSocketManager):
             await self._auth()
 
         await resubscribe_to_topics()
+        await self._send_initial_ping()
 
         self.attempting_connection = False
 
@@ -214,15 +220,55 @@ class _AsyncWebSocketManager(_WebSocketManager):
 
     async def _on_close(self):
         self.connected = False
+        if hasattr(self, "ping_task") and self.ping_task:
+            self.ping_task.cancel()
+            self.ping_task = None
         super()._on_close()
 
     async def _process_normal_message(self, message: dict):
-        callback_function, callback_data = super()._process_normal_message(message=message, parse_only=True)
+        callback_function, callback_data = super()._process_normal_message(
+            message=message, parse_only=True
+        )
 
         if callback_function is None:
             return
 
         await callback_function(callback_data)
+
+    async def _send_custom_ping(self):
+        """Send a custom ping message to keep the connection alive."""
+        try:
+            if self.ws and not self.ws.closed and self.is_connected():
+                await self.ws.send_str(self.custom_ping_message)
+                logger.debug(f"Sent ping message: {self.custom_ping_message}")
+        except Exception as e:
+            logger.debug(f"Failed to send ping: {e}")
+            if hasattr(self, "ping_task") and self.ping_task:
+                self.ping_task.cancel()
+                self.ping_task = None
+
+    async def _ping_loop(self):
+        """Continuously send ping messages at the specified interval."""
+        try:
+            while self.is_connected() and not getattr(self, "exited", False):
+                await asyncio.sleep(self.ping_interval)
+                if self.is_connected() and not getattr(self, "exited", False):
+                    await self._send_custom_ping()
+        except asyncio.CancelledError:
+            logger.debug("Ping loop cancelled")
+        except Exception as e:
+            logger.exception(f"Ping loop error: {e}")
+
+    async def _send_initial_ping(self):
+        """Start the ping loop to keep the connection alive."""
+        if self.ping_task:
+            self.ping_task.cancel()
+
+        if self.ping_interval > 0:
+            self.ping_task = self.loop.create_task(self._ping_loop())
+            logger.debug(
+                f"Started ping loop with interval {self.ping_interval} seconds"
+            )
 
 
 # # # # # # # # # #
@@ -235,7 +281,9 @@ class _AsyncWebSocketManager(_WebSocketManager):
 class _FuturesWebSocketManager(_AsyncWebSocketManager):
     def __init__(self, ws_name, **kwargs):
         callback_function = (
-            kwargs.pop("callback_function") if kwargs.get("callback_function") else self._handle_incoming_message
+            kwargs.pop("callback_function")
+            if kwargs.get("callback_function")
+            else self._handle_incoming_message
         )
 
         super().__init__(callback_function, ws_name, **kwargs)
@@ -285,14 +333,19 @@ class _FuturesWebSocketManager(_AsyncWebSocketManager):
 
         # If we get unsuccessful auth, notify user.
         elif message.get("data") != "success":  # !!!!
-            logger.debug(f"Authorization for {self.ws_name} failed. Please check your API keys and restart.")
+            logger.debug(
+                f"Authorization for {self.ws_name} failed. Please check your API keys and restart."
+            )
 
     async def _handle_incoming_message(self, message: dict):
         def is_auth_message():
             return message.get("channel", "") == "rs.login"
 
         def is_subscription_message():
-            return message.get("channel", "").startswith("rs.sub") or message.get("channel", "") == "rs.personal.filter"
+            return (
+                message.get("channel", "").startswith("rs.sub")
+                or message.get("channel", "") == "rs.personal.filter"
+            )
 
         def is_pong_message():
             return message.get("channel", "") in ("pong", "clientId")
@@ -359,13 +412,17 @@ class _FuturesWebSocket(_FuturesWebSocketManager):
 class _SpotWebSocketManager(_AsyncWebSocketManager):
     def __init__(self, ws_name, **kwargs):
         callback_function = (
-            kwargs.pop("callback_function") if kwargs.get("callback_function") else self._handle_incoming_message
+            kwargs.pop("callback_function")
+            if kwargs.get("callback_function")
+            else self._handle_incoming_message
         )
         super().__init__(callback_function, ws_name, **kwargs)
 
         self.private_topics = ["account", "deals", "orders"]
 
-    async def subscribe(self, topic: str, callback: Callable, params_list: list, interval: str = None):
+    async def subscribe(
+        self, topic: str, callback: Callable, params_list: list, interval: str = None
+    ):
         subscription_args = {
             "method": "SUBSCRIPTION",
             "params": [
@@ -402,7 +459,9 @@ class _SpotWebSocketManager(_AsyncWebSocketManager):
         for i in range(len(topics)):
             topic = topics[i]
             if isinstance(topic, str) and topic not in self.subscriptions:
-                logger.error(f"[unsubscribe] Topic {topic} not found in subscriptions, skipping")
+                logger.error(
+                    f"[unsubscribe] Topic {topic} not found in subscriptions, skipping"
+                )
                 topics.pop(i)
                 continue
 
@@ -427,12 +486,16 @@ class _SpotWebSocketManager(_AsyncWebSocketManager):
         else:
             # some funcs in list
             topics = [
-                x.__name__.replace("_stream", "").replace("_", ".") if getattr(x, "__name__", None) else x
+                x.__name__.replace("_stream", "").replace("_", ".")
+                if getattr(x, "__name__", None)
+                else x
                 #
                 for x in topics
             ]
 
-            topics = [self.func_to_topic[x] if x in self.func_to_topic else x for x in topics]
+            topics = [
+                self.func_to_topic[x] if x in self.func_to_topic else x for x in topics
+            ]
             return await self.unsubscribe(*topics)
 
     async def _handle_incoming_message(self, message):
@@ -444,7 +507,27 @@ class _SpotWebSocketManager(_AsyncWebSocketManager):
             else:
                 return False
 
-        if isinstance(message, dict) and is_subscription_message():
+        def is_pong_message():
+            # Check for pong response to ping
+            if isinstance(message, dict):
+                # Spot WebSocket pong format: {"id": 0, "code": 0, "msg": "PONG"}
+                # or {"method": "pong"} or similar
+                msg_value = message.get("msg", "").upper()
+                if (
+                    msg_value == "PONG"
+                    or message.get("method") == "pong"
+                    or message.get("ret_msg") == "pong"
+                    or message.get("op") == "pong"
+                ):
+                    return True
+            return False
+
+        # Check pong first, as it might also have id=0 and code=0
+        if is_pong_message():
+            logger.debug("Received pong message")
+            # Pong received, connection is alive
+            pass
+        elif isinstance(message, dict) and is_subscription_message():
             self._process_subscription_message(message)
         else:
             await self._process_normal_message(message)
@@ -469,9 +552,13 @@ class _SpotWebSocket(_SpotWebSocketManager):
         self.endpoint = endpoint
         loop = loop or asyncio.get_event_loop()
 
-        super().__init__(self.ws_name, api_key=api_key, api_secret=api_secret, loop=loop, **kwargs)
+        super().__init__(
+            self.ws_name, api_key=api_key, api_secret=api_secret, loop=loop, **kwargs
+        )
 
-    async def _ws_subscribe(self, topic, callback, params: list = [], interval: str = None):
+    async def _ws_subscribe(
+        self, topic, callback, params: list = [], interval: str = None
+    ):
         if isinstance(topic, str) and topic.startswith("private."):
             ensure_listen_key = getattr(self, "_ensure_listen_key", None)
             logger.debug(f"ensure_listen_key: {ensure_listen_key}")
@@ -481,5 +568,7 @@ class _SpotWebSocket(_SpotWebSocketManager):
         if not self.is_connected():
             await self._connect(self.endpoint)
 
-        logger.info(f"Subscribing to topic: {topic} | params: {params} | interval: {interval}")
+        logger.info(
+            f"Subscribing to topic: {topic} | params: {params} | interval: {interval}"
+        )
         await self.subscribe(topic, callback, params, interval)
